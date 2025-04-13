@@ -1,228 +1,269 @@
-using System.Collections;
 using System.Collections.Generic;
 using Unity.Netcode;
 using UnityEngine;
 
-/// <summary>
-/// Contrôle la logique du carré du joueur côté client et serveur.
-/// Ce script gère la capture des inputs, la prédiction côté client,
-/// l'envoi des inputs avec leur tick, et la réconciliation avec l'état autoritaire.
-/// </summary>
+public struct TickInput : INetworkSerializeByMemcpy
+{
+    public int tick;
+    public Vector2 input;
+}
+
+public struct SimulationResult : INetworkSerializeByMemcpy
+{
+    public TickInput tickInput;
+    public Vector2 position;
+}
+
 public class Player : NetworkBehaviour
 {
     [SerializeField]
-    private float m_Velocity = 5f; // Vitesse du joueur
+    private float m_Velocity;
 
     [SerializeField]
-    private float m_Size = 1f; // Utilisé pour la gestion des collisions
+    private float m_Size = 1;
 
     private GameState m_GameState;
+
+    // GameState peut etre nul si l'entite joueur est instanciee avant de charger MainScene
     private GameState GameState
     {
         get
         {
             if (m_GameState == null)
+            {
                 m_GameState = FindObjectOfType<GameState>();
+            }
             return m_GameState;
         }
     }
 
-    // Variable réseau contenant la position autoritaire (mise à jour par le serveur)
-    private NetworkVariable<Vector2> m_Position = new NetworkVariable<Vector2>();
-    public Vector2 Position => m_Position.Value;
+    private NetworkVariable<SimulationResult> m_LastServerSimulationResult = new();
+    private Vector2 m_LocalPosition = new();
+    public Vector2 Position => (IsClient) ? m_LocalPosition : m_LastServerSimulationResult.Value.position;
 
-    // Variable réseau pour le dernier tick traité par le serveur (pour la réconciliation)
-    private NetworkVariable<int> m_ServerTick = new NetworkVariable<int>();
-    public int ServerTick => m_ServerTick.Value;
+    private Queue<TickInput> m_TickInputQueue = new();
+    private Queue<SimulationResult> m_History = new();
 
-    // File d'attente côté serveur pour stocker les inputs reçus avec leur tick associé.
-    private Queue<InputFrame> m_InputQueue = new Queue<InputFrame>();
-
-    // Structure pour stocker un input avec son tick et la position prédite après application.
-    private struct InputFrame
+    public override void OnNetworkSpawn()
     {
-        public int Tick;
-        public Vector2 Input;
-        public Vector2 Position;
+        if (IsClient)
+        {
+            m_LastServerSimulationResult.OnValueChanged += OnLastServerSimulationResultChanged;
+        }
     }
 
-    // Historique des inputs côté client (pour rejouer les inputs si correction nécessaire)
-    private List<InputFrame> m_InputHistory = new List<InputFrame>();
-
-    // Position locale prédite par le client (mise à jour immédiatement lors d'un input)
-    private Vector2 m_PredictedPosition;
-
-    // Tick local servant d'horodatage pour chaque input
-    private int m_LocalTick = 0;
-
-    public Vector2 PredictedPosition => m_PredictedPosition;
+    public override void OnNetworkDespawn()
+    {
+        if (IsClient)
+        {
+            m_LastServerSimulationResult.OnValueChanged -= OnLastServerSimulationResultChanged;
+        }
+    }
 
     private void Awake()
     {
         m_GameState = FindObjectOfType<GameState>();
-        // Initialisation de la position prédite avec celle reçue initialement du serveur
-        m_PredictedPosition = m_Position.Value;
     }
 
     private void FixedUpdate()
     {
-        // Si le jeu est en état "stun" ou si GameState n'est pas disponible, ne rien faire
+        // Si le stun est active, rien n'est mis a jour.
         if (GameState == null || GameState.IsStunned)
+        {
             return;
+        }
 
-        // Logique serveur : traiter les inputs reçus
+        // Seul le serveur met à jour la position de l'entite.
         if (IsServer)
         {
-            ProcessInputQueue();
+            var serverSimulationResult = Simulate(m_LastServerSimulationResult.Value.position, m_TickInputQueue);
+            if (!serverSimulationResult.Equals(default))
+            {
+                m_LastServerSimulationResult.Value = serverSimulationResult;
+            }
         }
 
-        // Logique client : capture des inputs et réconciliation uniquement pour le joueur possédé
+        // Seul le client qui possede cette entite peut envoyer ses inputs.
         if (IsClient && IsOwner)
         {
-            TryReconcile();
-            ProcessLocalInput();
-            // Passage au tick suivant
-            m_LocalTick++;
-        }
-    }
+            var tickInput = new TickInput { tick = NetworkUtility.GetLocalTick(), input = GetInputClient() };
+            m_TickInputQueue.Enqueue(tickInput);
 
-    /// <summary>
-    /// Traitement des inputs en file côté serveur.
-    /// À chaque input, la position autoritaire est mise à jour, avec vérification des collisions.
-    /// Le dernier tick traité est stocké dans m_ServerTick.
-    /// </summary>
-    private void ProcessInputQueue()
-    {
-        if (m_InputQueue.Count > 0)
+            var clientSimulationResult = Simulate(m_LocalPosition, m_TickInputQueue);
+            m_LocalPosition = clientSimulationResult.position;
+            m_History.Enqueue(clientSimulationResult);
+
+            SendTickInputServerRpc(tickInput);
+        }
+
+        // Seul le client qui ne possèdent pas cette entite peut estimer sa position.
+
+        if (IsClient && !IsOwner)
         {
-            InputFrame frame = m_InputQueue.Dequeue();
+            var tickInput = m_LastServerSimulationResult.Value.tickInput;
 
-            // Mise à jour de la position du joueur
-            m_Position.Value += frame.Input * m_Velocity * Time.fixedDeltaTime;
+            var clientSimulationResult = SimulateGhost(m_LocalPosition, tickInput);
+            m_LocalPosition = clientSimulationResult.position;
+            m_History.Enqueue(clientSimulationResult);
 
-            // Gestion des collisions avec les bords de la zone de jeu
-            Vector2 pos = m_Position.Value;
-            Vector2 size = GameState.GameSize;
-            if (pos.x - m_Size < -size.x)
-                pos.x = -size.x + m_Size;
-            else if (pos.x + m_Size > size.x)
-                pos.x = size.x - m_Size;
-            if (pos.y - m_Size < -size.y)
-                pos.y = -size.y + m_Size;
-            else if (pos.y + m_Size > size.y)
-                pos.y = size.y - m_Size;
-            m_Position.Value = pos;
-
-            // Mise à jour du tick autoritaire en fonction de l'input traité
-            m_ServerTick.Value = frame.Tick;
         }
+
+    }
+    private SimulationResult SimulateGhost(Vector2 position, TickInput lastServerTick)
+    {
+        //On estime l'input du joueur fantôme par rapport au dernier input reçu
+        var estimatedtickInput = new TickInput { tick = NetworkUtility.GetLocalTick(), input = lastServerTick.input };
+        position += estimatedtickInput.input * m_Velocity * Time.fixedDeltaTime;
+
+        // Gestion des collisions avec l'exterieur de la zone de simulation
+        var size = GameState.GameSize;
+        if (position.x - m_Size < -size.x)
+        {
+            position = new Vector2(-size.x + m_Size, position.y);
+        }
+        else if (position.x + m_Size > size.x)
+        {
+            position = new Vector2(size.x - m_Size, position.y);
+        }
+
+        if (position.y + m_Size > size.y)
+        {
+            position = new Vector2(position.x, size.y - m_Size);
+        }
+        else if (position.y - m_Size < -size.y)
+        {
+            position = new Vector2(position.x, -size.y + m_Size);
+        }
+        return new SimulationResult { tickInput = estimatedtickInput, position = position };
+    }
+    private SimulationResult Simulate(Vector2 position, Queue<TickInput> tickInputQueue)
+    {
+        // Mise a jour de la position selon dernier input reçu, puis consommation de l'input
+        if (tickInputQueue.Count > 0)
+        {
+            var tickInput = tickInputQueue.Dequeue();
+            position += tickInput.input * m_Velocity * Time.fixedDeltaTime;
+
+            // Gestion des collisions avec l'exterieur de la zone de simulation
+            var size = GameState.GameSize;
+            if (position.x - m_Size < -size.x)
+            {
+                position = new Vector2(-size.x + m_Size, position.y);
+            }
+            else if (position.x + m_Size > size.x)
+            {
+                position = new Vector2(size.x - m_Size, position.y);
+            }
+
+            if (position.y + m_Size > size.y)
+            {
+                position = new Vector2(position.x, size.y - m_Size);
+            }
+            else if (position.y - m_Size < -size.y)
+            {
+                position = new Vector2(position.x, -size.y + m_Size);
+            }
+
+            return new SimulationResult { tickInput = tickInput, position = position };
+        }
+
+        return default;
     }
 
-    /// <summary>
-    /// Capture des inputs côté client et envoi au serveur.
-    /// Applique immédiatement l'input en local pour une simulation réactive.
-    /// </summary>
-    private void ProcessLocalInput()
+    private Vector2 GetInputClient()
     {
-        Vector2 inputDirection = Vector2.zero;
-        if (Input.GetKey(KeyCode.W))
+        Vector2 inputDirection = new Vector2(0, 0);
+        if (Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow))
+        {
             inputDirection += Vector2.up;
-        if (Input.GetKey(KeyCode.A))
+        }
+        if (Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow))
+        {
             inputDirection += Vector2.left;
-        if (Input.GetKey(KeyCode.S))
+        }
+        if (Input.GetKey(KeyCode.S) || Input.GetKey(KeyCode.DownArrow))
+        {
             inputDirection += Vector2.down;
-        if (Input.GetKey(KeyCode.D))
+        }
+        if (Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow))
+        {
             inputDirection += Vector2.right;
-
-        inputDirection = inputDirection.normalized;
-
-        // Si une direction est indiquée, appliquer l'input localement
-        if (inputDirection != Vector2.zero)
-        {
-            m_PredictedPosition += inputDirection * m_Velocity * Time.fixedDeltaTime;
-
-            // Création d'un InputFrame enregistré pour le tick courant
-            InputFrame frame = new InputFrame
-            {
-                Tick = m_LocalTick,
-                Input = inputDirection,
-                Position = m_PredictedPosition
-            };
-            m_InputHistory.Add(frame);
-
-            // Limiter la taille de l'historique (pour éviter une accumulation excessive)
-            if (m_InputHistory.Count > 200)
-                m_InputHistory.RemoveAt(0);
         }
-
-        // Envoyer l'input au serveur, même s'il s'agit d'un input nul, pour assurer la synchronisation des ticks
-        SendInputServerRpc(inputDirection, m_LocalTick);
+        return inputDirection.normalized;
     }
 
-    /// <summary>
-    /// ServerRPC : le client envoie son input avec le tick associé.
-    /// Le serveur crée alors un InputFrame qui est ajouté à la file d'attente.
-    /// </summary>
-    /// <param name="input">Direction d'input envoyée par le client</param>
-    /// <param name="tick">Tick local du client lors de l'envoi</param>
     [ServerRpc]
-    private void SendInputServerRpc(Vector2 input, int tick)
+    private void SendTickInputServerRpc(TickInput tickInput)
     {
-        InputFrame frame = new InputFrame
-        {
-            Tick = tick,
-            Input = input,
-            Position = Vector2.zero // La position n'est pas nécessaire côté serveur
-        };
-        m_InputQueue.Enqueue(frame);
+        // On utilise une file pour les inputs pour les cas ou on en recoit plusieurs en meme temps.
+        m_TickInputQueue.Enqueue(tickInput);
     }
 
-    /// <summary>
-    /// Réconciliation côté client.
-    /// Compare l'état autoritaire (m_Position) avec la prédiction enregistrée pour le tick traité par le serveur.
-    /// En cas d'erreur supérieure au seuil défini, corrige la position prédite et rejoue les inputs non confirmés.
-    /// </summary>
-    private void TryReconcile()
+    private void OnLastServerSimulationResultChanged(SimulationResult previous, SimulationResult current)
     {
-        // Cherche dans l'historique l'input correspondant au dernier tick reçu du serveur
-        InputFrame? matchingFrame = null;
-        foreach (var frame in m_InputHistory)
+        while (m_History.Count > 0 && m_History.Peek().tickInput.tick < current.tickInput.tick)
         {
-            if (frame.Tick == m_ServerTick.Value)
-            {
-                matchingFrame = frame;
-                break;
-            }
+            m_History.Dequeue();
         }
-
-        if (matchingFrame.HasValue)
+        if (m_History.Count > 0 && m_History.Peek().tickInput.tick == current.tickInput.tick)
         {
-            // Comparer la position autoritaire à la position prédite enregistrée pour ce tick
-            float error = Vector2.Distance(m_Position.Value, matchingFrame.Value.Position);
-            if (error > 0.01f)
+            var clientSimulationResult = m_History.Dequeue();
+            if (IsOwner)
             {
-                Debug.LogWarning($"[RECONCILE] Erreur détectée au tick {matchingFrame.Value.Tick}: {error}. Correction appliquée.");
-                // Correction : la position prédite est remplacée par la position autoritaire
-                m_PredictedPosition = m_Position.Value;
-
-                // Rejouer les inputs dont le tick est supérieur à celui confirmé par le serveur
-                List<InputFrame> framesToReplay = m_InputHistory.FindAll(f => f.Tick > matchingFrame.Value.Tick);
-                m_InputHistory.RemoveAll(f => f.Tick > matchingFrame.Value.Tick);
-
-                foreach (var f in framesToReplay)
+                if (clientSimulationResult.position != current.position)
                 {
-                    m_PredictedPosition += f.Input * m_Velocity * Time.fixedDeltaTime;
-                    // Enregistrer à nouveau le frame avec la nouvelle position calculée
-                    InputFrame newFrame = new InputFrame
-                    {
-                        Tick = f.Tick,
-                        Input = f.Input,
-                        Position = m_PredictedPosition
-                    };
-                    m_InputHistory.Add(newFrame);
+                    Reconciliate(current);
+
                 }
-                Debug.Log($"[RECONCILE] {framesToReplay.Count} inputs rejoués après correction.");
+            }
+            else
+            {
+                //Réconciliation de la prédiction des ghosts par le client
+                if (clientSimulationResult.position != current.position
+                || clientSimulationResult.tickInput.input != current.tickInput.input)
+                {
+                    ReconciliateGhst(current);
+
+                }
             }
         }
+    }
+
+    private void Reconciliate(SimulationResult serverSimulationResult)
+    {
+        var tempPosition = serverSimulationResult.position;
+        Queue<TickInput> tempTickInputQueue = new();
+        Queue<SimulationResult> correctedHistory = new();
+        while (m_History.Count > 0)
+        {
+            var clientSimulationResult = m_History.Dequeue();
+            tempTickInputQueue.Enqueue(clientSimulationResult.tickInput);
+            var correctedSimulationResult = Simulate(tempPosition, tempTickInputQueue);
+            tempPosition = correctedSimulationResult.position;
+            correctedHistory.Enqueue(correctedSimulationResult);
+        }
+        //Debug.Log($"Reconciliate: {this.GetInstanceID()} {IsOwner} {m_LocalPosition} -> {tempPosition}");
+        m_LocalPosition = tempPosition;
+        m_History = correctedHistory;
+    }
+
+    /*
+    Méthode qui gère la réconcialiation de la prédiction de l'état de ghosts pas un client avec celle du serveur
+    */
+    private void ReconciliateGhst(SimulationResult serverSimulationResult)
+    {
+        var tempPosition = serverSimulationResult.position;
+        var tempTick = serverSimulationResult.tickInput;
+
+        Queue<SimulationResult> correctedHistory = new();
+        if (m_History.Count > 0)
+        {
+            var clientSimulationResult = m_History.Dequeue();
+            var correctedSimulationResult = SimulateGhost(tempPosition, tempTick);
+            tempPosition = correctedSimulationResult.position;
+            correctedHistory.Enqueue(correctedSimulationResult);
+        }
+        m_LocalPosition = tempPosition;
+        m_History = correctedHistory;
     }
 }

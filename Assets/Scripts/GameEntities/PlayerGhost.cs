@@ -5,9 +5,9 @@ using UnityEngine;
 
 public class PlayerGhost : NetworkBehaviour
 {
-    [SerializeField] 
+    [SerializeField]
     private Player m_Player;
-    [SerializeField] 
+    [SerializeField]
     private SpriteRenderer m_SpriteRenderer;
 
     public override void OnNetworkSpawn()
@@ -21,15 +21,6 @@ public class PlayerGhost : NetworkBehaviour
 
     private void Update()
     {
-        if (IsOwner)
-        {
-            // Affichage de la position prédite pour une réactivité maximale
-            transform.position = m_Player.PredictedPosition;
-        }
-        else
-        {
-            // Pour les autres, utiliser la position autoritaire synchronisée
-            transform.position = m_Player.Position;
-        }
+        transform.position = m_Player.Position;
     }
 }
